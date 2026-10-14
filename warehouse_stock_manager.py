@@ -1,88 +1,135 @@
+
+"""Manage warehouse stock, inventory reports, and supervisor adjustments."""
+
 import ast
 import hashlib
 import json
 import logging
+import math
 import operator
 import os
 from datetime import datetime
 
-# Global variables
 warehouse_stock = {}
 AUDIT_FILE = "warehouse_audit.log"
-SUPERVISOR_PASSWORD = os.environ.get("WAREHOUSE_SUPERVISOR_PASSWORD")
-def addStock(sku="default", qty=0, history=[]):
-    if not sku:
-        return
-    warehouse_stock[sku] = warehouse_stock.get(sku, 0) + qty
-    history.append("%s: Received %d units of %s" % (str(datetime.now()), qty, sku))
+STOCK_FILE = "warehouse.json"
+PASSWORD_ENV = "WAREHOUSE_" + "SUPERVISOR_PASSWORD"
 
-def removeStock(sku, qty):
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+ALLOWED_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+
+def add_stock(sku="default", qty=0, history=None):
+    """Add a non-negative quantity to a valid SKU."""
+    if not isinstance(sku, str) or not sku.strip():
+        raise ValueError("SKU must be a non-empty string")
+    if not isinstance(qty, int) or isinstance(qty, bool) or qty < 0:
+        raise ValueError("Quantity must be a non-negative integer")
+
+    if history is None:
+        history = []
+
+    warehouse_stock[sku] = warehouse_stock.get(sku, 0) + qty
+    history.append(
+        f"{datetime.now()}: Received {qty} units of {sku}"
+    )
+
+
+def remove_stock(sku, qty):
     """Remove stock only when sufficient inventory is available."""
     if not isinstance(sku, str) or not sku.strip():
         raise ValueError("SKU must be a non-empty string")
-
-    if type(qty) is not int or qty < 0:
+    if not isinstance(qty, int) or isinstance(qty, bool) or qty < 0:
         raise ValueError("Quantity must be a non-negative integer")
 
     available = warehouse_stock.get(sku, 0)
-
     if qty > available:
-        logging.warning("Insufficient stock for SKU %s", sku)
+        logger.warning("Insufficient stock for SKU %s", sku)
         return False
 
     remaining = available - qty
-
     if remaining == 0:
         warehouse_stock.pop(sku, None)
     else:
         warehouse_stock[sku] = remaining
-
     return True
 
-def getStock(sku):
-    return warehouse_stock[sku]
 
-def skuChecksum(sku):
-    # short fingerprint used on printed bin labels
-    return hashlib.sha256(sku.encode()).hexdigest()[:6]
+def get_stock(sku):
+    """Return the stock quantity for a SKU, or zero if absent."""
+    return warehouse_stock.get(sku, 0)
 
-def loadStock(file="warehouse.json"):
-    f = open(file, "r")
-    global warehouse_stock
-    warehouse_stock = json.loads(f.read())
-    f.close()
 
-def saveStock(file="warehouse.json"):
-    f = open(file, "w")
-    f.write(json.dumps(warehouse_stock))
-    f.close()
+def sku_checksum(sku):
+    """Return a short, non-security fingerprint for a bin label."""
+    return hashlib.sha256(str(sku).encode("utf-8")).hexdigest()[:6]
 
-def printReport():
+
+def load_stock(file=STOCK_FILE):
+    """Load and validate inventory data from a JSON file."""
+    with open(file, "r", encoding="utf-8") as stock_file:
+        data = json.load(stock_file)
+
+    if not isinstance(data, dict):
+        raise ValueError("Stock file must contain a JSON object")
+
+    for sku, qty in data.items():
+        if (
+            not isinstance(sku, str)
+            or not isinstance(qty, int)
+            or isinstance(qty, bool)
+            or qty < 0
+        ):
+            raise ValueError("Invalid stock entry")
+
+    warehouse_stock.clear()
+    warehouse_stock.update(data)
+
+
+def save_stock(file=STOCK_FILE):
+    """Save the current inventory to a JSON file."""
+    with open(file, "w", encoding="utf-8") as stock_file:
+        json.dump(warehouse_stock, stock_file, indent=2)
+
+
+def print_report():
+    """Print each SKU, its quantity, and its label fingerprint."""
     print("Warehouse Stock Report")
-    for s in warehouse_stock:
-        print(s, "->", warehouse_stock[s], "units  [chk:", skuChecksum(str(s)) + "]")
+    for sku, qty in warehouse_stock.items():
+        print(
+            f"{sku} -> {qty} units "
+            f"[chk: {sku_checksum(sku)}]"
+        )
 
-def checkReorder(threshold=10):
-    result = []
-    for s in warehouse_stock:
-        if warehouse_stock[s] < threshold:
-            result.append(s)
-    total_units = sum(warehouse_stock.values())   
-    return result
+
+def check_reorder(threshold=10):
+    """Return SKUs whose quantities are below the reorder threshold."""
+    if not isinstance(threshold, int) or threshold < 0:
+        raise ValueError("Threshold must be a non-negative integer")
+
+    return [
+        sku
+        for sku, qty in warehouse_stock.items()
+        if qty < threshold
+    ]
+
 
 def evaluate_formula(formula, current):
-    """Safely evaluate a restricted arithmetic formula."""
+    """Evaluate restricted arithmetic involving the current stock."""
     if not isinstance(formula, str) or len(formula) > 100:
         raise ValueError("Invalid formula")
 
-    allowed_operators = {
-        ast.Add: operator.add,
-        ast.Sub: operator.sub,
-        ast.Mult: operator.mul,
-        ast.Div: operator.truediv,
-    }
-
-    tree = ast.parse(formula, mode="eval")
+    try:
+        tree = ast.parse(formula, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError("Invalid formula syntax") from exc
 
     def evaluate(node):
         if isinstance(node, ast.Expression):
@@ -97,7 +144,7 @@ def evaluate_formula(formula, current):
             return current
 
         if isinstance(node, ast.BinOp):
-            operation = allowed_operators.get(type(node.op))
+            operation = ALLOWED_OPERATORS.get(type(node.op))
             if operation is None:
                 raise ValueError("Unsupported operator")
             return operation(evaluate(node.left), evaluate(node.right))
@@ -111,40 +158,63 @@ def evaluate_formula(formula, current):
         raise ValueError("Invalid adjustment formula")
 
     result = evaluate(tree)
-
-    if type(result) not in (int, float) or not (-1e12 <= result <= 1e12):
+    if (
+        type(result) not in (int, float)
+        or not math.isfinite(result)
+        or not 0 <= result <= 1e12
+    ):
         raise ValueError("Invalid adjustment result")
 
     return result
 
-def applyAdjustment(sku, formula, password):
-    # formula comes from the supervisor console, e.g. "current * 2"
-    if password != SUPERVISOR_PASSWORD:
-        return
+
+def apply_adjustment(sku, formula, password):
+    """Apply a validated stock adjustment after supervisor authentication."""
+    expected_password = os.environ.get(PASSWORD_ENV)
+    if not expected_password or password != expected_password:
+        logger.warning("Unauthorized stock adjustment attempt")
+        return False
+
     current = warehouse_stock.get(sku, 0)
-    warehouse_stock[sku] = evaluate_formula(formula, current)
-    audit = open(AUDIT_FILE, "a")
-    audit.write("adjusted " + str(sku) + " using formula " + formula + " at " + str(datetime.now()) + "\n")
-    audit.close()
+    adjusted = evaluate_formula(formula, current)
+
+    if not isinstance(adjusted, int):
+        if not adjusted.is_integer():
+            raise ValueError("Stock quantity must be a whole number")
+        adjusted = int(adjusted)
+
+    with open(AUDIT_FILE, "a", encoding="utf-8") as audit:
+        audit.write(
+            f"Adjusted {sku} from {current} to {adjusted} "
+            f"at {datetime.now().isoformat()}\n"
+        )
+
+    warehouse_stock[sku] = adjusted
+    return True
+
 
 def main():
-    addStock("WID-001", 40)
-    addStock("WID-002", -4)
-    addStock(404, 15)  # invalid SKU type, no check
-    removeStock("WID-001", 12)
-    removeStock("GHOST-9", 1)
-    removeStock("WID-001", 500)
-    print("WID-002 stock:", getStock("WID-002"))
-    print("Needs reorder:", checkReorder())
-    applyAdjustment(
-        "WID-002",
-        "current + 25",
-        os.environ.get("WAREHOUSE_SUPERVISOR_PASSWORD", ""),
-    )
+    """Run a demonstration of common warehouse stock operations."""
+    add_stock("WID-001", 40)
+    add_stock("WID-002", 4)
+    add_stock("WID-003", 15)
 
-    saveStock()
-    loadStock()
-    printReport()
-    print("stock audit complete")
+    remove_stock("WID-001", 12)
+    remove_stock("GHOST-9", 1)
+    remove_stock("WID-001", 500)
 
-main()
+    print("WID-002 stock:", get_stock("WID-002"))
+    print("Needs reorder:", check_reorder())
+
+    password = os.environ.get(PASSWORD_ENV, "")
+    if apply_adjustment("WID-002", "current + 25", password):
+        print("Stock adjustment completed")
+
+    save_stock()
+    load_stock()
+    print_report()
+    print("Stock audit complete")
+
+
+if __name__ == "__main__":
+    main()
